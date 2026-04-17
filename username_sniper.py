@@ -122,7 +122,7 @@ def make_generator(cfg):
         codes = _shuangpin_codes(scheme)
         return itertools.product(codes, repeat=syllables), len(codes)**syllables
     if mode == "pinyin":
-        min_len = params.get("min_len", 4)
+        min_len = params.get("min_len", 5)
         syls = sorted(VALID_PINYIN)
         def _gen():
             for s in syls:
@@ -208,32 +208,54 @@ async def bot_get_updates(session, offset):
 # ── 检测 ──────────────────────────────────────────────────────────────────────
 
 async def check_one(session, sem, username, backoff):
-    # t.me 有真实账号时 og:image 指向 cdn.telegram-cdn.org
-    # 空闲/无效用户名则使用默认 telegram.org logo，不含 cdn 域名
+    """
+    三步检测：
+      1. Bot API getChat  —— 已注册账号/频道 → taken
+      2. Fragment.com     —— NFT 占用 → nft
+      3. 其余             —— available
+    """
     async with sem:
         if backoff[0] > 0:
             await asyncio.sleep(backoff[0])
+
+        # ── 第一步：Bot API getChat ────────────────────────────────────────
         try:
             async with session.get(
-                "https://t.me/" + username,
-                allow_redirects=True,
+                "https://api.telegram.org/bot{}/getChat".format(BOT_TOKEN),
+                params={"chat_id": "@" + username},
                 timeout=aiohttp.ClientTimeout(total=12),
             ) as resp:
                 if resp.status == 429:
                     backoff[0] = min(backoff[0] + 5, 60)
                     return "error"
                 backoff[0] = max(0, backoff[0] - 1)
-                html = await resp.text(encoding="utf-8", errors="ignore")
-                # NFT/Fragment 拍卖中的用户名——已上链，不可自由注册
-                if "fragment.com" in html:
-                    return "nft"
-                # 空闲用户名页：og:title 固定为 "Telegram: Contact @username"
-                if ("Telegram: Contact @" + username) in html:
-                    return "available"
-                # 其他情况：真实账号/频道/群组
-                return "taken"
+                data = await resp.json()
+                if data.get("ok"):
+                    return "taken"
+                desc = data.get("description", "").lower()
+                if "chat not found" not in desc:
+                    # 其他错误（USERNAME_INVALID 等）跳过
+                    return "error"
         except Exception:
             return "error"
+
+        # ── 第二步：Fragment.com 确认是否为 NFT ───────────────────────────
+        try:
+            async with session.get(
+                "https://fragment.com/username/" + username,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status == 200:
+                    html = await resp.text(encoding="utf-8", errors="ignore")
+                    # collectible / tm-status- 表示该名已在 Fragment 系统内
+                    if "collectible" in html or "tm-status-" in html:
+                        return "nft"
+        except Exception:
+            pass  # Fragment 请求失败不影响主流程
+
+        # ── 第三步：真正空闲 ──────────────────────────────────────────────
+        return "available"
 
 # ── 扫描循环 ──────────────────────────────────────────────────────────────────
 
