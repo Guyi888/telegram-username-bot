@@ -239,7 +239,22 @@ async def check_one(session, sem, username, backoff):
         except Exception:
             return "error"
 
-        # ── 第二步：Fragment.com 确认是否为 NFT ───────────────────────────
+        # ── 第二步：t.me 检查（捕获隐私设置的个人账号）────────────────────
+        try:
+            async with session.get(
+                "https://t.me/" + username,
+                headers={"User-Agent": "Mozilla/5.0"},
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                html = await resp.text(encoding="utf-8", errors="ignore")
+                # tgme_page_title 只在真实账号/频道页面存在
+                if "tgme_page_title" in html:
+                    return "taken"
+        except Exception:
+            pass
+
+        # ── 第三步：Fragment.com 确认是否为 NFT ───────────────────────────
         try:
             async with session.get(
                 "https://fragment.com/username/" + username,
@@ -248,13 +263,12 @@ async def check_one(session, sem, username, backoff):
             ) as resp:
                 if resp.status == 200:
                     html = await resp.text(encoding="utf-8", errors="ignore")
-                    # collectible / tm-status- 表示该名已在 Fragment 系统内
                     if "collectible" in html or "tm-status-" in html:
                         return "nft"
         except Exception:
-            pass  # Fragment 请求失败不影响主流程
+            pass
 
-        # ── 第三步：真正空闲 ──────────────────────────────────────────────
+        # ── 第四步：真正空闲 ──────────────────────────────────────────────
         return "available"
 
 # ── 扫描循环 ──────────────────────────────────────────────────────────────────
