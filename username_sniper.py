@@ -44,9 +44,9 @@ DB_FILE     = "sniper_state.db"
 # 每个 Token 独立限速，8 个并发/Token
 # 在这里添加更多 Bot Token：
 SNIPER_TOKENS = [
-    "8690075574:AAE2QCYhb08SXET1ukWWXxePPsJFaZM5KVg",  # Bot 1（主）
-    # "111111111:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",       # Bot 2
-    # "222222222:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",       # Bot 3
+    "8690075574:AAE2QCYhb08SXET1ukWWXxePPsJFaZM5KVg",          # Bot 1（主）
+    "8766221920:AAHg62TK5rt2PDKlpMwnZmN_UOeTvRiIC94",          # Bot 2
+    "8685117355:AAFf-w2gZ_NRPoEduR_ibufALsg9iTosUAI",          # Bot 3
 ]
 CONCURRENCY = len(SNIPER_TOKENS) * 8  # 自动随 Token 数量扩容
 
