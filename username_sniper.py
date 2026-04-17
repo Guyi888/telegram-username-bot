@@ -151,6 +151,39 @@ def combo_to_str(combo):
 def valid_tg(u):
     return 4 <= len(u) <= 32 and u[0].isalpha() and all(c.isalnum() or c == "_" for c in u)
 
+# ── 可读性过滤 & 实用性评分 ───────────────────────────────────────────────────
+
+_VOWELS = set("aeiou")
+
+def is_pronounceable(s):
+    """字母模式过滤：至少含1个元音，连续辅音不超过3个"""
+    if not any(c in _VOWELS for c in s):
+        return False
+    streak = 0
+    for c in s:
+        if c not in _VOWELS:
+            streak += 1
+            if streak > 3:
+                return False
+        else:
+            streak = 0
+    return True
+
+def score_username(username):
+    """实用性评分，返回 (score, stars字符串)"""
+    u = username.lower()
+    score = 0
+    # 越短越好
+    score += max(0, 10 - len(u))
+    # 元音比例越高越易读
+    vowel_ratio = sum(1 for c in u if c in _VOWELS) / max(len(u), 1)
+    score += int(vowel_ratio * 4)
+    # 无连续重复字符加分
+    if not any(u[i] == u[i + 1] for i in range(len(u) - 1)):
+        score += 2
+    stars = min(5, max(1, score // 2))
+    return score, "⭐" * stars
+
 # ── 状态 DB ───────────────────────────────────────────────────────────────────
 
 class StateDB:
@@ -158,6 +191,13 @@ class StateDB:
         self.conn = sqlite3.connect(DB_FILE)
         self.conn.execute("CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, value TEXT)")
         self.conn.execute("CREATE TABLE IF NOT EXISTS found (username TEXT PRIMARY KEY, found_at TEXT)")
+        self.conn.execute("""
+            CREATE TABLE IF NOT EXISTS candidates (
+                username TEXT PRIMARY KEY,
+                found_at TEXT,
+                status   TEXT DEFAULT 'pending'
+            )
+        """)
         self.conn.commit()
 
     def get_offset(self, key):
@@ -175,6 +215,33 @@ class StateDB:
 
     def all_found(self):
         return [r[0] for r in self.conn.execute("SELECT username FROM found ORDER BY found_at DESC")]
+
+    # ── 冷冻期候选 ──────────────────────────────────────────────────────────
+    def add_candidate(self, username):
+        self.conn.execute(
+            "INSERT OR IGNORE INTO candidates(username,found_at,status) VALUES(?,?,'pending')",
+            (username, datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        )
+        self.conn.commit()
+
+    def get_due_candidates(self, days=30):
+        """返回发现满 days 天且仍 pending 的用户名"""
+        rows = self.conn.execute("""
+            SELECT username FROM candidates
+            WHERE status='pending'
+              AND julianday('now') - julianday(found_at) >= ?
+            ORDER BY found_at
+        """, (days,)).fetchall()
+        return [r[0] for r in rows]
+
+    def update_candidate(self, username, status):
+        self.conn.execute("UPDATE candidates SET status=? WHERE username=?", (status, username))
+        self.conn.commit()
+
+    def all_candidates(self):
+        return self.conn.execute(
+            "SELECT username, found_at, status FROM candidates ORDER BY found_at DESC"
+        ).fetchall()
 
 # ── 配置 ──────────────────────────────────────────────────────────────────────
 
@@ -300,6 +367,15 @@ async def run_sniper(state, db, session):
 
     state["stats"] = {"checked": 0, "found": 0, "speed": 0.0, "total": total, "offset": offset}
 
+    mode = cfg["mode"]
+
+    def _should_check(u):
+        if not valid_tg(u):
+            return False
+        if mode == "letters" and not is_pronounceable(u):
+            return False
+        return True
+
     def _submit(abs_idx, username):
         tok  = SNIPER_TOKENS[abs_idx % n_tok]
         task = asyncio.ensure_future(check_one(session, username, tok))
@@ -308,7 +384,7 @@ async def run_sniper(state, db, session):
     # 预填窗口
     for combo in gen:
         u = combo_to_str(combo)
-        if valid_tg(u):
+        if _should_check(u):
             _submit(gen_idx, u)
         gen_idx += 1
         if len(pending) >= CONCURRENCY:
@@ -344,6 +420,7 @@ async def run_sniper(state, db, session):
                 found   += 1
                 checked += 1
                 db.add_found(username)
+                db.add_candidate(username)      # 加入冷冻期重扫队列
                 with open("found.txt", "a") as f:
                     f.write(username + "\n")
                 newly.append(username)
@@ -354,18 +431,19 @@ async def run_sniper(state, db, session):
             for combo in gen:
                 u = combo_to_str(combo)
                 gen_idx += 1
-                if valid_tg(u):
+                if _should_check(u):
                     _submit(gen_idx - 1, u)
                     break
 
         # 持久化进度
         db.save_offset(key, offset)
 
-        # 推送通知
+        # 推送通知（含实用性评分）
         if newly:
             lines = ["🎯 <b>发现可注册靓号！</b>"]
             for u in newly:
-                lines.append("• <code>@{0}</code>  <a href='https://t.me/{0}'>查看</a>".format(u))
+                _, stars = score_username(u)
+                lines.append("• <code>@{0}</code> {1}  <a href='https://t.me/{0}'>查看</a>".format(u, stars))
             await bot_send(session, "\n".join(lines))
             newly = []
 
@@ -391,7 +469,7 @@ async def handle_cmd(text, state, db, session):
     if cmd == "start":
         await bot_send(session,
             "🤖 <b>Username Sniper 运行中</b>\n\n"
-            "/mode letters 5 — 5位纯字母\n"
+            "/mode letters 5 — 5位纯字母（过滤不可读组合）\n"
             "/mode letters 4 — 4位纯字母\n"
             "/mode shuangpin — 小鹤双拼2音节\n"
             "/mode shuangpin 3 — 3音节双拼\n"
@@ -400,7 +478,8 @@ async def handle_cmd(text, state, db, session):
             "/status — 查看进度\n"
             "/stop — 暂停\n"
             "/resume — 继续\n"
-            "/found — 已发现靓号"
+            "/found — 已发现靓号\n"
+            "/candidates — 冷冻期候选列表"
         )
 
     elif cmd == "mode":
@@ -474,10 +553,54 @@ async def handle_cmd(text, state, db, session):
         else:
             lines = ["🎯 <b>已发现靓号（共{}个）</b>".format(len(usernames))]
             for u in usernames[:30]:
-                lines.append("• <code>@{0}</code>  <a href='https://t.me/{0}'>查看</a>".format(u))
+                _, stars = score_username(u)
+                lines.append("• <code>@{0}</code> {1}  <a href='https://t.me/{0}'>查看</a>".format(u, stars))
             if len(usernames) > 30:
                 lines.append("…还有{}个，查看 found.txt 获取完整列表".format(len(usernames) - 30))
             await bot_send(session, "\n".join(lines))
+
+    elif cmd == "candidates":
+        rows = db.all_candidates()
+        confirmed = [(u, d) for u, d, s in rows if s == "confirmed"]
+        pending   = [(u, d) for u, d, s in rows if s == "pending"]
+        if not rows:
+            await bot_send(session, "📋 暂无候选用户名。")
+            return
+        lines = ["📋 <b>冷冻期候选用户名</b>\n"]
+        if confirmed:
+            lines.append("🔓 已过冷冻期可注册（{}个）：".format(len(confirmed)))
+            for u, d in confirmed[:20]:
+                _, stars = score_username(u)
+                lines.append("• <code>@{}</code> {}".format(u, stars))
+            lines.append("")
+        lines.append("⏳ 待满30天重扫（{}个）：".format(len(pending)))
+        for u, d in pending[:15]:
+            lines.append("• <code>@{}</code>  发现于 {}".format(u, d[:10]))
+        await bot_send(session, "\n".join(lines))
+
+# ── 冷冻期重扫（每24小时检查一次满30天的候选）────────────────────────────────
+
+async def run_recheck(db, session):
+    await asyncio.sleep(3600)          # 启动1小时后首次运行
+    while True:
+        due = db.get_due_candidates(days=30)
+        if due:
+            confirmed = []
+            for username in due:
+                result = await check_one(session, username, SNIPER_TOKENS[0])
+                if result == "available":
+                    db.update_candidate(username, "confirmed")
+                    confirmed.append(username)
+                else:
+                    db.update_candidate(username, "taken")
+                await asyncio.sleep(0.2)
+            if confirmed:
+                lines = ["🔓 <b>冷冻期已过，确认可注册！</b>"]
+                for u in confirmed:
+                    _, stars = score_username(u)
+                    lines.append("• <code>@{0}</code> {1}  <a href='https://t.me/{0}'>查看</a>".format(u, stars))
+                await bot_send(session, "\n".join(lines))
+        await asyncio.sleep(86400)     # 24小时后再次运行
 
 # ── Bot 轮询 ──────────────────────────────────────────────────────────────────
 
@@ -519,6 +642,7 @@ async def main():
     )
 
     asyncio.ensure_future(run_bot(state, db, session))
+    asyncio.ensure_future(run_recheck(db, session))
 
     while True:
         if state["cfg"]["running"]:
