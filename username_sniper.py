@@ -35,11 +35,20 @@ try:
 except ImportError:
     sys.exit("请安装依赖：pip3 install aiohttp")
 
-BOT_TOKEN   = "8690075574:AAE2QCYhb08SXET1ukWWXxePPsJFaZM5KVg"
+BOT_TOKEN   = "8690075574:AAE2QCYhb08SXET1ukWWXxePPsJFaZM5KVg"  # 控制Bot（接命令+发通知）
 CHAT_ID     = "877532"
-CONCURRENCY = 8
 CONFIG_FILE = "sniper_config.json"
 DB_FILE     = "sniper_state.db"
+
+# ── 多 Token 池（用于 getChat 检测，越多速度越快）────────────────────────────
+# 每个 Token 独立限速，8 个并发/Token
+# 在这里添加更多 Bot Token：
+SNIPER_TOKENS = [
+    "8690075574:AAE2QCYhb08SXET1ukWWXxePPsJFaZM5KVg",  # Bot 1（主）
+    # "111111111:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",       # Bot 2
+    # "222222222:AAxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",       # Bot 3
+]
+CONCURRENCY = len(SNIPER_TOKENS) * 8  # 自动随 Token 数量扩容
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -207,7 +216,7 @@ async def bot_get_updates(session, offset):
 
 # ── 检测 ──────────────────────────────────────────────────────────────────────
 
-async def check_one(session, sem, username):
+async def check_one(session, sem, username, token):
     """
     四步检测：
       1. Bot API getChat     —— 已注册账号/频道 → taken
@@ -219,7 +228,7 @@ async def check_one(session, sem, username):
         # ── 第一步：Bot API getChat ────────────────────────────────────────
         try:
             async with session.get(
-                "https://api.telegram.org/bot{}/getChat".format(BOT_TOKEN),
+                "https://api.telegram.org/bot{}/getChat".format(token),
                 params={"chat_id": "@" + username},
                 timeout=aiohttp.ClientTimeout(total=12),
             ) as resp:
@@ -290,7 +299,8 @@ async def run_sniper(state, db, session):
 
     async def flush(b):
         nonlocal checked, found
-        tasks = [asyncio.ensure_future(check_one(session, sem, u)) for u in b]
+        n_tok = len(SNIPER_TOKENS)
+        tasks = [asyncio.ensure_future(check_one(session, sem, u, SNIPER_TOKENS[i % n_tok])) for i, u in enumerate(b)]
         results = await asyncio.gather(*tasks)
         newly = []
         for u, st in zip(b, results):
