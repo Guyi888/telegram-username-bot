@@ -289,9 +289,10 @@ async def run_sniper(state, db, session):
             state["cfg"]["running"] = False
             return
 
-    checked = 0
-    found   = 0
-    t_start = time.time()
+    checked    = 0
+    found      = 0
+    t_start    = time.time()
+    init_offset = offset  # 本次启动的起始位置，用于计算实际迭代速度
     n_tok   = len(SNIPER_TOKENS)
     gen_idx = offset          # 绝对索引，用于轮询 token
     pending = {}              # task → (abs_idx, username)
@@ -368,12 +369,15 @@ async def run_sniper(state, db, session):
             await bot_send(session, "\n".join(lines))
             newly = []
 
-        # 更新统计
-        elapsed = time.time() - t_start
-        speed   = checked / elapsed * 60 if elapsed > 0 else 0
+        # 更新统计（用迭代速度算 ETA，与 offset 量纲一致）
+        elapsed    = time.time() - t_start
+        iter_done  = offset - init_offset
+        iter_speed = iter_done / elapsed * 60 if elapsed > 0 else 0
+        speed      = checked / elapsed * 60 if elapsed > 0 else 0
         state["stats"] = {
             "checked": checked, "found": found,
-            "speed": speed, "total": total, "offset": offset,
+            "speed": speed, "iter_speed": iter_speed,
+            "total": total, "offset": offset,
         }
 
     await bot_send(session, "✅ 当前模式全部检测完毕，共发现 {} 个靓号。".format(found))
@@ -431,12 +435,13 @@ async def handle_cmd(text, state, db, session):
         s   = state.get("stats", {})
         cfg = state["cfg"]
         running_str = "运行中 ▶" if cfg.get("running") else "已暂停 ⏸"
-        speed   = s.get("speed", 0.0)
-        total   = s.get("total", 0)
-        offset  = s.get("offset", 0)
-        pct     = offset / total * 100 if total > 0 else 0
-        eta     = (total - offset) / speed if speed > 0 else 0
-        eta_str = "{:.0f}分钟".format(eta) if eta < 1440 else "{:.1f}小时".format(eta / 60)
+        speed      = s.get("speed", 0.0)
+        iter_speed = s.get("iter_speed", speed)
+        total      = s.get("total", 0)
+        offset     = s.get("offset", 0)
+        pct        = offset / total * 100 if total > 0 else 0
+        eta        = (total - offset) / iter_speed if iter_speed > 0 else 0
+        eta_str    = "{:.0f}分钟".format(eta) if eta < 1440 else "{:.1f}小时".format(eta / 60)
         await bot_send(session,
             "📊 <b>扫描状态</b>\n\n"
             "状态：{}\n"
