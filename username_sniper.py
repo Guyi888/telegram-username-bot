@@ -48,7 +48,7 @@ SNIPER_TOKENS = [
     "8766221920:AAHg62TK5rt2PDKlpMwnZmN_UOeTvRiIC94",          # Bot 2
     "8685117355:AAFf-w2gZ_NRPoEduR_ibufALsg9iTosUAI",          # Bot 3
 ]
-CONCURRENCY = len(SNIPER_TOKENS) * 8  # 自动随 Token 数量扩容
+CONCURRENCY = len(SNIPER_TOKENS) * 3  # 每个Token 3并发，稳定在限速线以下
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
