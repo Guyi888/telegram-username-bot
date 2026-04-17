@@ -37,7 +37,7 @@ except ImportError:
 
 BOT_TOKEN   = "8690075574:AAE2QCYhb08SXET1ukWWXxePPsJFaZM5KVg"
 CHAT_ID     = "877532"
-CONCURRENCY = 100
+CONCURRENCY = 20
 CONFIG_FILE = "sniper_config.json"
 DB_FILE     = "sniper_state.db"
 
@@ -207,36 +207,39 @@ async def bot_get_updates(session, offset):
 
 # ── 检测 ──────────────────────────────────────────────────────────────────────
 
-async def check_one(session, sem, username, backoff):
+async def check_one(session, sem, username):
     """
-    三步检测：
-      1. Bot API getChat  —— 已注册账号/频道 → taken
-      2. Fragment.com     —— NFT 占用 → nft
-      3. 其余             —— available
+    四步检测：
+      1. Bot API getChat     —— 已注册账号/频道 → taken
+      2. t.me tgme_page_title —— 隐私设置个人账号 → taken
+      3. Fragment.com        —— NFT 占用 → nft
+      4. 其余                —— available
     """
     async with sem:
-        if backoff[0] > 0:
-            await asyncio.sleep(backoff[0])
-
         # ── 第一步：Bot API getChat ────────────────────────────────────────
-        try:
-            async with session.get(
-                "https://api.telegram.org/bot{}/getChat".format(BOT_TOKEN),
-                params={"chat_id": "@" + username},
-                timeout=aiohttp.ClientTimeout(total=12),
-            ) as resp:
-                if resp.status == 429:
-                    backoff[0] = min(backoff[0] + 5, 60)
-                    return "error"
-                backoff[0] = max(0, backoff[0] - 1)
-                data = await resp.json()
-                if data.get("ok"):
-                    return "taken"
-                desc = data.get("description", "").lower()
-                if "chat not found" not in desc:
-                    # 其他错误（USERNAME_INVALID 等）跳过
-                    return "error"
-        except Exception:
+        for attempt in range(3):
+            try:
+                async with session.get(
+                    "https://api.telegram.org/bot{}/getChat".format(BOT_TOKEN),
+                    params={"chat_id": "@" + username},
+                    timeout=aiohttp.ClientTimeout(total=12),
+                ) as resp:
+                    if resp.status == 429:
+                        # 429：只让当前协程等待，不影响其他并发
+                        data = await resp.json()
+                        wait = data.get("parameters", {}).get("retry_after", 5)
+                        await asyncio.sleep(wait)
+                        continue
+                    data = await resp.json()
+                    if data.get("ok"):
+                        return "taken"
+                    desc = data.get("description", "").lower()
+                    if "chat not found" not in desc:
+                        return "error"
+                    break
+            except Exception:
+                return "error"
+        else:
             return "error"
 
         # ── 第二步：t.me 检查（捕获隐私设置的个人账号）────────────────────
@@ -288,7 +291,6 @@ async def run_sniper(state, db, session):
             return
 
     sem     = asyncio.Semaphore(CONCURRENCY)
-    backoff = [0]
     checked = 0
     found   = 0
     t_start = time.time()
@@ -296,7 +298,7 @@ async def run_sniper(state, db, session):
 
     async def flush(b):
         nonlocal checked, found
-        tasks = [asyncio.ensure_future(check_one(session, sem, u, backoff)) for u in b]
+        tasks = [asyncio.ensure_future(check_one(session, sem, u)) for u in b]
         results = await asyncio.gather(*tasks)
         newly = []
         for u, st in zip(b, results):
