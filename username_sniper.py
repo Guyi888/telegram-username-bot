@@ -207,9 +207,9 @@ async def bot_get_updates(session, offset):
 
 # ── 检测 ──────────────────────────────────────────────────────────────────────
 
-_TAKEN_MARKERS = ("cdn.telegram-cdn.org", "tgme_page_photo", "tgme_page_additional_info")
-
 async def check_one(session, sem, username, backoff):
+    # t.me 有真实账号时 og:image 指向 cdn.telegram-cdn.org
+    # 空闲/无效用户名则使用默认 telegram.org logo，不含 cdn 域名
     async with sem:
         if backoff[0] > 0:
             await asyncio.sleep(backoff[0])
@@ -224,7 +224,16 @@ async def check_one(session, sem, username, backoff):
                     return "error"
                 backoff[0] = max(0, backoff[0] - 1)
                 html = await resp.text(encoding="utf-8", errors="ignore")
-                return "taken" if any(m in html for m in _TAKEN_MARKERS) else "available"
+                # NFT/Fragment 拍卖中的用户名——已上链，不可自由注册
+                if "fragment.com" in html:
+                    return "nft"
+                # 只有真实账号/频道的页面才有 CDN 头像链接
+                if "cdn.telegram-cdn.org" in html:
+                    return "taken"
+                # 二次确认：t.me 有时无头像但有真实页面标题
+                if 'property="og:title"' in html and "telegram.org" not in html[html.find('property="og:title"'):html.find('property="og:title"')+200]:
+                    return "taken"
+                return "available"
         except Exception:
             return "error"
 
@@ -259,11 +268,12 @@ async def run_sniper(state, db, session):
         for u, st in zip(b, results):
             if st == "available":
                 found += 1
+                checked += 1
                 db.add_found(u)
                 with open("found.txt", "a") as f:
                     f.write(u + "\n")
                 newly.append(u)
-            elif st != "error":
+            elif st in ("taken", "nft"):
                 checked += 1
         if newly:
             lines = ["🎯 <b>发现可注册靓号！</b>"]
