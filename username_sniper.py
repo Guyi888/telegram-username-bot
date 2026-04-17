@@ -1,63 +1,52 @@
 #!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Telegram Username Sniper
-========================
-通过并发 HTTP 请求 t.me 批量检测用户名可用性。
+Telegram Username Sniper — Bot 控制版
+通过 Bot 指令切换模式、查看进度、暂停恢复。
 
-支持模式：
-  letters   — N位纯字母（如 5 位：26^5 ≈ 1200万）
-  shuangpin — 双拼靓号（小鹤/自然码，2~3音节）
-  pinyin    — 常见拼音组合（单/双音节）
+Bot 命令：
+  /mode letters 5         — 切换到5位纯字母
+  /mode letters 4         — 切换到4位纯字母
+  /mode shuangpin         — 小鹤双拼2音节(4字符)
+  /mode shuangpin 3       — 小鹤双拼3音节(6字符)
+  /mode shuangpin 2 ziranma — 自然码双拼
+  /mode pinyin            — 拼音组合
+  /status                 — 当前进度/速度/已发现数
+  /stop                   — 暂停扫描
+  /resume                 — 继续扫描
+  /found                  — 查看已发现的靓号
 
-特性：
-  · 100并发协程，速度 500~2000个/分钟
-  · SQLite 断点续传，中断后从上次进度继续
-  · 发现靓号写入 found.txt + 可选 Telegram Bot 推送通知
-  · 自动处理频率限制（429 / 连接错误指数退避）
-
-依赖安装：
-  pip install aiohttp
-
-用法示例：
-  python username_sniper.py letters 5
-  python username_sniper.py letters 4 --concurrency 150
-  python username_sniper.py shuangpin --scheme xiaohe
-  python username_sniper.py shuangpin 3 --scheme ziranma
-  python username_sniper.py pinyin
-  python username_sniper.py --token BOT_TOKEN --chat CHAT_ID letters 5
+依赖：pip3 install aiohttp
 """
 
-import argparse
 import asyncio
 import itertools
 import json
 import logging
-import signal
 import sqlite3
 import string
 import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Iterator
 
 try:
     import aiohttp
 except ImportError:
-    sys.exit("请先安装依赖：pip install aiohttp")
+    sys.exit("请安装依赖：pip3 install aiohttp")
 
-# ── 日志 ──────────────────────────────────────────────────────────────────────
+BOT_TOKEN   = "8690075574:AAE2QCYhb08SXET1ukWWXxePPsJFaZM5KVg"
+CHAT_ID     = "877532"
+CONCURRENCY = 100
+CONFIG_FILE = "sniper_config.json"
+DB_FILE     = "sniper_state.db"
 
-logging.basicConfig(
-    level=logging.WARNING,
-    format="%(asctime)s %(levelname)s %(message)s",
-    handlers=[logging.StreamHandler()],
-)
+logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# ── 拼音数据 ──────────────────────────────────────────────────────────────────
+# ── 拼音 & 双拼 ───────────────────────────────────────────────────────────────
 
-VALID_PINYIN: frozenset = frozenset([
+VALID_PINYIN = [
     "a","o","e","ai","ei","ao","ou","an","en","ang","eng","er",
     "ba","bo","bi","bu","bai","bei","bao","ban","ben","bin","bing","bang","beng","bian","biao","bie",
     "pa","po","pi","pu","pai","pei","pao","pou","pan","pen","pin","ping","pang","peng","pian","piao","pie",
@@ -82,340 +71,387 @@ VALID_PINYIN: frozenset = frozenset([
     "sa","se","si","su","sai","sao","sou","san","sen","sun","sang","seng","song","suan","sui",
     "ya","ye","yi","yo","yu","yao","you","yan","yin","yun","yue","yuan","yang","ying","yong",
     "wa","wo","wu","wai","wei","wan","wen","wang","weng",
-])
-
-# ── 双拼方案 ──────────────────────────────────────────────────────────────────
+]
 
 _SCHEMES = {
     "xiaohe": {
-        "init": {"zh":"v","ch":"i","sh":"u",**{c:c for c in "bpmfdtnlgkhjqxrzcsyw"},"":""},
-        "final": {
-            "a":"a","o":"o","e":"e","i":"i","u":"u","v":"v",
-            "ai":"d","ei":"w","ui":"v","uei":"v","ao":"c","ou":"z","iu":"q","iou":"q",
-            "ie":"p","ve":"t","ue":"t","er":"r",
-            "an":"j","en":"f","in":"b","un":"n","uen":"n","vn":"m",
-            "ang":"h","eng":"g","ing":"k","ong":"s",
-            "ia":"x","ua":"x","uo":"o","uai":"y",
-            "iang":"l","uang":"l","iong":"s","ian":"m","uan":"r","van":"r",
-        },
+        "init":  {"zh":"v","ch":"i","sh":"u","b":"b","p":"p","m":"m","f":"f","d":"d","t":"t","n":"n","l":"l","g":"g","k":"k","h":"h","j":"j","q":"q","x":"x","r":"r","z":"z","c":"c","s":"s","y":"y","w":"w","":""},
+        "final": {"a":"a","o":"o","e":"e","i":"i","u":"u","v":"v","ai":"d","ei":"w","ui":"v","uei":"v","ao":"c","ou":"z","iu":"q","iou":"q","ie":"p","ve":"t","ue":"t","er":"r","an":"j","en":"f","in":"b","un":"n","uen":"n","vn":"m","ang":"h","eng":"g","ing":"k","ong":"s","ia":"x","ua":"x","uo":"o","uai":"y","iang":"l","uang":"l","iong":"s","ian":"m","uan":"r","van":"r"},
     },
     "ziranma": {
-        "init": {"zh":"v","ch":"i","sh":"u",**{c:c for c in "bpmfdtnlgkhjqxrzcsyw"},"":""},
-        "final": {
-            "a":"a","o":"o","e":"e","i":"i","u":"u","v":"v",
-            "ai":"l","ei":"q","ui":"v","uei":"v","ao":"k","ou":"b","iu":"r","iou":"r",
-            "ie":"x","ve":"t","ue":"t","er":"j",
-            "an":"j","en":"f","in":"n","un":"p","uen":"p","vn":"m",
-            "ang":"h","eng":"g","ing":"y","ong":"s",
-            "ia":"w","ua":"w","uo":"o","uai":"y",
-            "iang":"t","uang":"d","iong":"s","ian":"m","uan":"r","van":"r",
-        },
+        "init":  {"zh":"v","ch":"i","sh":"u","b":"b","p":"p","m":"m","f":"f","d":"d","t":"t","n":"n","l":"l","g":"g","k":"k","h":"h","j":"j","q":"q","x":"x","r":"r","z":"z","c":"c","s":"s","y":"y","w":"w","":""},
+        "final": {"a":"a","o":"o","e":"e","i":"i","u":"u","v":"v","ai":"l","ei":"q","ui":"v","uei":"v","ao":"k","ou":"b","iu":"r","iou":"r","ie":"x","ve":"t","ue":"t","er":"j","an":"j","en":"f","in":"n","un":"p","uen":"p","vn":"m","ang":"h","eng":"g","ing":"y","ong":"s","ia":"w","ua":"w","uo":"o","uai":"y","iang":"t","uang":"d","iong":"s","ian":"m","uan":"r","van":"r"},
     },
 }
 
-_TWO_INITS = ("zh","ch","sh")
-_ONE_INITS  = set("bpmfdtnlgkhjqxrzcsyw")
-
-def _split(syllable: str):
-    for ti in _TWO_INITS:
+def _split(syllable):
+    for ti in ("zh","ch","sh"):
         if syllable.startswith(ti):
             return ti, syllable[len(ti):]
-    if syllable[0] in _ONE_INITS and syllable[0] not in "yw":
+    if syllable[0] in set("bpmfdtnlgkhjqxrzcsyw") and syllable[0] not in "yw":
         return syllable[0], syllable[1:]
     return "", syllable
 
-def _to_code(syllable: str, scheme: str) -> str | None:
+def _shuangpin_codes(scheme):
     s = _SCHEMES[scheme]
-    init, final = _split(syllable)
-    if init in ("","y","w"):
-        fk = s["final"].get(final) or s["final"].get(final.lstrip("iuvy"))
-        if fk is None:
-            return None
-        return syllable[0] + fk
-    ik = s["init"].get(init)
-    fk = s["final"].get(final)
-    if ik is None or fk is None:
-        return None
-    return ik + fk
-
-def _shuangpin_codes(scheme: str) -> list[str]:
     codes = set()
     for syl in VALID_PINYIN:
-        c = _to_code(syl, scheme)
-        if c and len(c) == 2 and c.isalpha():
-            codes.add(c)
+        init, final = _split(syl)
+        if init in ("","y","w"):
+            fk = s["final"].get(final) or s["final"].get(final.lstrip("iuvy"))
+            if fk:
+                codes.add(syl[0] + fk)
+        else:
+            ik = s["init"].get(init)
+            fk = s["final"].get(final)
+            if ik and fk:
+                codes.add(ik + fk)
     return sorted(codes)
 
 # ── 生成器 ────────────────────────────────────────────────────────────────────
 
-def gen_letters(length: int) -> Iterator[str]:
-    for combo in itertools.product(string.ascii_lowercase, repeat=length):
-        yield "".join(combo)
-
-def gen_shuangpin(syllables: int, scheme: str) -> Iterator[str]:
-    codes = _shuangpin_codes(scheme)
-    for combo in itertools.product(codes, repeat=syllables):
-        yield "".join(combo)
-
-def gen_pinyin(max_syllables: int = 2, min_len: int = 4) -> Iterator[str]:
-    syls = sorted(VALID_PINYIN)
-    for s in syls:
-        if len(s) >= min_len:
-            yield s
-    if max_syllables >= 2:
-        for s1, s2 in itertools.product(syls, syls):
-            combo = s1 + s2
-            if min_len <= len(combo) <= 32:
-                yield combo
-
-def build_generator(mode: str, args) -> tuple[Iterator[str], int]:
-    """返回 (生成器, 估计总量)"""
+def make_generator(cfg):
+    mode   = cfg["mode"]
+    params = cfg.get("params", {})
     if mode == "letters":
-        n = args.length
-        return gen_letters(n), 26 ** n
+        length = params.get("length", 5)
+        return itertools.product(string.ascii_lowercase, repeat=length), 26**length
     if mode == "shuangpin":
-        codes = _shuangpin_codes(args.scheme)
-        n = args.syllables
-        return gen_shuangpin(n, args.scheme), len(codes) ** n
+        syllables = params.get("syllables", 2)
+        scheme    = params.get("scheme", "xiaohe")
+        codes = _shuangpin_codes(scheme)
+        return itertools.product(codes, repeat=syllables), len(codes)**syllables
     if mode == "pinyin":
-        n = len(VALID_PINYIN)
-        return gen_pinyin(args.max_syllables, args.min_len), n + n * n
-    raise ValueError(f"未知模式: {mode}")
+        min_len = params.get("min_len", 4)
+        syls = sorted(VALID_PINYIN)
+        def _gen():
+            for s in syls:
+                if len(s) >= min_len:
+                    yield s
+            for s1, s2 in itertools.product(syls, syls):
+                c = s1 + s2
+                if min_len <= len(c) <= 32:
+                    yield c
+        n = len(syls)
+        return _gen(), n + n*n
+    return iter([]), 0
 
-# ── 状态数据库 ────────────────────────────────────────────────────────────────
+def combo_to_str(combo):
+    return "".join(combo) if isinstance(combo, tuple) else combo
+
+def valid_tg(u):
+    return 4 <= len(u) <= 32 and u[0].isalpha() and all(c.isalnum() or c == "_" for c in u)
+
+# ── 状态 DB ───────────────────────────────────────────────────────────────────
 
 class StateDB:
-    def __init__(self, path: str):
-        self.conn = sqlite3.connect(path)
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS progress (
-                key   TEXT PRIMARY KEY,
-                value TEXT
-            )""")
-        self.conn.execute("""
-            CREATE TABLE IF NOT EXISTS found (
-                username   TEXT PRIMARY KEY,
-                found_at   TEXT
-            )""")
+    def __init__(self):
+        self.conn = sqlite3.connect(DB_FILE)
+        self.conn.execute("CREATE TABLE IF NOT EXISTS progress (key TEXT PRIMARY KEY, value TEXT)")
+        self.conn.execute("CREATE TABLE IF NOT EXISTS found (username TEXT PRIMARY KEY, found_at TEXT)")
         self.conn.commit()
 
-    def get_offset(self, key: str) -> int:
-        row = self.conn.execute(
-            "SELECT value FROM progress WHERE key=?", (key,)).fetchone()
+    def get_offset(self, key):
+        row = self.conn.execute("SELECT value FROM progress WHERE key=?", (key,)).fetchone()
         return int(row[0]) if row else 0
 
-    def save_offset(self, key: str, offset: int):
-        self.conn.execute(
-            "INSERT OR REPLACE INTO progress(key,value) VALUES(?,?)",
-            (key, str(offset)))
+    def save_offset(self, key, n):
+        self.conn.execute("INSERT OR REPLACE INTO progress(key,value) VALUES(?,?)", (key, str(n)))
         self.conn.commit()
 
-    def add_found(self, username: str):
-        self.conn.execute(
-            "INSERT OR IGNORE INTO found(username,found_at) VALUES(?,?)",
-            (username, datetime.now().isoformat()))
+    def add_found(self, username):
+        self.conn.execute("INSERT OR IGNORE INTO found(username,found_at) VALUES(?,?)",
+                          (username, datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
         self.conn.commit()
 
-    def all_found(self) -> list[str]:
-        return [r[0] for r in self.conn.execute(
-            "SELECT username FROM found ORDER BY found_at")]
+    def all_found(self):
+        return [r[0] for r in self.conn.execute("SELECT username FROM found ORDER BY found_at DESC")]
 
-    def close(self):
-        self.conn.close()
+# ── 配置 ──────────────────────────────────────────────────────────────────────
 
-# ── HTTP 检测 ─────────────────────────────────────────────────────────────────
+def load_config():
+    if Path(CONFIG_FILE).exists():
+        with open(CONFIG_FILE, "r") as f:
+            return json.load(f)
+    return {"mode": "letters", "params": {"length": 5}, "running": True}
 
-# t.me 有真实用户/频道时页面含 CDN 头像链接；无用户时只有默认 logo
+def save_config(cfg):
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f, ensure_ascii=False, indent=2)
+
+def config_key(cfg):
+    return json.dumps({"mode": cfg["mode"], "params": cfg.get("params", {})}, sort_keys=True)
+
+# ── Bot API ───────────────────────────────────────────────────────────────────
+
+API = "https://api.telegram.org/bot" + BOT_TOKEN
+
+async def bot_send(session, text):
+    try:
+        await session.post(API + "/sendMessage", json={
+            "chat_id": CHAT_ID, "text": text,
+            "parse_mode": "HTML", "disable_web_page_preview": True,
+        }, timeout=aiohttp.ClientTimeout(total=10))
+    except Exception as e:
+        logger.warning("bot_send: %s", e)
+
+async def bot_get_updates(session, offset):
+    try:
+        async with session.get(API + "/getUpdates", params={
+            "offset": offset, "timeout": 20, "allowed_updates": ["message"],
+        }, timeout=aiohttp.ClientTimeout(total=30)) as r:
+            d = await r.json()
+            return d.get("result", [])
+    except Exception:
+        return []
+
+# ── 检测 ──────────────────────────────────────────────────────────────────────
+
 _TAKEN_MARKERS = ("cdn.telegram-cdn.org", "tgme_page_photo", "tgme_page_additional_info")
 
-async def check_one(session: aiohttp.ClientSession, sem: asyncio.Semaphore,
-                    username: str, backoff: list) -> str:
-    """返回 'available' | 'taken' | 'error'"""
+async def check_one(session, sem, username, backoff):
     async with sem:
         if backoff[0] > 0:
             await asyncio.sleep(backoff[0])
         try:
-            url = f"https://t.me/{username}"
-            async with session.get(url, allow_redirects=True,
-                                   timeout=aiohttp.ClientTimeout(total=12)) as resp:
+            async with session.get(
+                "https://t.me/" + username,
+                allow_redirects=True,
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
                 if resp.status == 429:
                     backoff[0] = min(backoff[0] + 5, 60)
-                    logger.warning("429 rate-limit — 退避 %ds", backoff[0])
                     return "error"
                 backoff[0] = max(0, backoff[0] - 1)
                 html = await resp.text(encoding="utf-8", errors="ignore")
-                if any(m in html for m in _TAKEN_MARKERS):
-                    return "taken"
-                return "available"
-        except asyncio.TimeoutError:
-            return "error"
-        except Exception as e:
-            logger.debug("check %s: %s", username, e)
+                return "taken" if any(m in html for m in _TAKEN_MARKERS) else "available"
+        except Exception:
             return "error"
 
-# ── Bot 推送通知 ───────────────────────────────────────────────────────────────
+# ── 扫描循环 ──────────────────────────────────────────────────────────────────
 
-async def notify_bot(session: aiohttp.ClientSession,
-                     token: str, chat_id: str, usernames: list[str]):
-    if not token or not chat_id:
-        return
-    lines = ["🎯 <b>发现可注册靓号！</b>"]
-    for u in usernames:
-        lines.append(f"• <code>@{u}</code>  <a href='https://t.me/{u}'>查看</a>")
-    text = "\n".join(lines)
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    try:
-        await session.post(url, json={
-            "chat_id": chat_id, "text": text,
-            "parse_mode": "HTML", "disable_web_page_preview": True,
-        }, timeout=aiohttp.ClientTimeout(total=10))
-    except Exception as e:
-        logger.warning("Bot 推送失败: %s", e)
+async def run_sniper(state, db, session):
+    cfg    = state["cfg"]
+    key    = config_key(cfg)
+    offset = db.get_offset(key)
 
-# ── 主循环 ────────────────────────────────────────────────────────────────────
-
-async def run(args):
-    gen, total = build_generator(args.mode, args)
-    state_key  = f"{args.mode}_{json.dumps(vars(args), sort_keys=True, default=str)[:60]}"
-    db_path    = f"sniper_{args.mode}.db"
-    found_path = Path("found.txt")
-
-    db     = StateDB(db_path)
-    offset = db.get_offset(state_key)
-
-    print(f"\n{'='*55}")
-    print(f"  模式: {args.mode}   预估总量: {total:,}")
-    print(f"  并发: {args.concurrency}   已跳过: {offset:,}")
-    print(f"  状态库: {db_path}   结果文件: found.txt")
-    print(f"{'='*55}\n")
-
-    # 跳过已检测部分
+    gen, total = make_generator(cfg)
     for _ in range(offset):
         try:
             next(gen)
         except StopIteration:
-            print("✅ 所有候选已检测完毕。")
-            db.close()
+            await bot_send(session, "✅ 当前模式已全部检测完毕。")
+            state["cfg"]["running"] = False
             return
 
-    sem     = asyncio.Semaphore(args.concurrency)
-    backoff = [0]  # 共享退避计数器（列表以便协程修改）
+    sem     = asyncio.Semaphore(CONCURRENCY)
+    backoff = [0]
     checked = 0
     found   = 0
-    errors  = 0
     t_start = time.time()
-    stop    = False
+    batch   = []
 
-    def _sigint(_s, _f):
-        nonlocal stop
-        stop = True
-        print("\n⏸  收到中断，正在保存进度...")
+    async def flush(b):
+        nonlocal checked, found
+        tasks = [asyncio.ensure_future(check_one(session, sem, u, backoff)) for u in b]
+        results = await asyncio.gather(*tasks)
+        newly = []
+        for u, st in zip(b, results):
+            if st == "available":
+                found += 1
+                db.add_found(u)
+                with open("found.txt", "a") as f:
+                    f.write(u + "\n")
+                newly.append(u)
+            elif st != "error":
+                checked += 1
+        if newly:
+            lines = ["🎯 <b>发现可注册靓号！</b>"]
+            for u in newly:
+                lines.append("• <code>@{0}</code>  <a href='https://t.me/{0}'>查看</a>".format(u))
+            await bot_send(session, "\n".join(lines))
+        return len(b)
 
-    signal.signal(signal.SIGINT, _sigint)
+    state["stats"] = {"checked": 0, "found": 0, "speed": 0.0, "total": total, "offset": offset}
 
-    conn_args = {
-        "connector": aiohttp.TCPConnector(limit=args.concurrency + 10, ssl=False),
-        "headers":   {"User-Agent": "Mozilla/5.0 (compatible; TelegramUsernameChecker/1.0)"},
-    }
+    for combo in gen:
+        if state.get("restart"):
+            state["restart"] = False
+            return
 
-    async with aiohttp.ClientSession(**conn_args) as session:
-        batch: list[str] = []
+        u = combo_to_str(combo)
+        if not valid_tg(u):
+            continue
 
-        async def flush_batch():
-            nonlocal checked, found, errors
-            if not batch:
+        while not state["cfg"]["running"]:
+            await asyncio.sleep(1)
+            if state.get("restart"):
+                state["restart"] = False
                 return
-            tasks = [
-                asyncio.create_task(check_one(session, sem, u, backoff))
-                for u in batch
-            ]
-            results = await asyncio.gather(*tasks)
-            newly_available = []
-            for u, status in zip(batch, results):
-                if status == "available":
-                    found += 1
-                    db.add_found(u)
-                    with open(found_path, "a", encoding="utf-8") as f:
-                        f.write(u + "\n")
-                    newly_available.append(u)
-                    print(f"\n🎯  可用靓号: @{u}")
-                elif status == "error":
-                    errors += 1
-                else:
-                    checked += 1
-            if newly_available:
-                await notify_bot(session, args.token, args.chat, newly_available)
-            batch.clear()
 
-        for username in gen:
-            if stop:
-                break
-            batch.append(username)
-            if len(batch) >= args.concurrency:
-                await flush_batch()
-                offset += args.concurrency
-                db.save_offset(state_key, offset)
+        batch.append(u)
+        if len(batch) >= CONCURRENCY:
+            done    = await flush(batch)
+            offset += done
+            db.save_offset(key, offset)
+            batch   = []
 
-                elapsed = time.time() - t_start
-                speed   = (checked + found + errors) / elapsed * 60 if elapsed > 0 else 0
-                done    = checked + found + errors
-                pct     = done / total * 100 if total > 0 else 0
-                eta_min = (total - done) / speed if speed > 0 else float("inf")
-                eta_str = f"{eta_min:.0f}分钟" if eta_min < 60*24 else f"{eta_min/60:.1f}小时"
+            elapsed = time.time() - t_start
+            speed   = (checked + found) / elapsed * 60 if elapsed > 0 else 0
+            state["stats"] = {
+                "checked": checked, "found": found,
+                "speed": speed, "total": total, "offset": offset,
+            }
 
-                print(
-                    f"\r  已检: {done:>9,}  速度: {speed:>6.0f}/min"
-                    f"  靓号: {found}  进度: {pct:.2f}%  剩余: {eta_str}    ",
-                    end="", flush=True,
-                )
+    if batch:
+        await flush(batch)
+        db.save_offset(key, offset + len(batch))
 
-        await flush_batch()  # 收尾
-        db.save_offset(state_key, offset + len(batch))
+    await bot_send(session, "✅ 当前模式全部检测完毕，共发现 {} 个靓号。".format(found))
 
-    db.close()
-    total_done = checked + found + errors
-    print(f"\n\n{'='*55}")
-    print(f"  完成！共检测 {total_done:,} 个，发现靓号 {found} 个")
-    if found:
-        print(f"  靓号列表已保存至 {found_path}")
-        for u in db.all_found()[-10:]:
-            print(f"    @{u}")
-    print(f"{'='*55}\n")
+# ── 指令处理 ──────────────────────────────────────────────────────────────────
 
-# ── 命令行参数 ────────────────────────────────────────────────────────────────
+async def handle_cmd(text, state, db, session):
+    parts = text.strip().split()
+    cmd   = parts[0].lower().lstrip("/").split("@")[0]
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Telegram 靓号用户名检测工具",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=__doc__,
+    if cmd == "start":
+        await bot_send(session,
+            "🤖 <b>Username Sniper 运行中</b>\n\n"
+            "/mode letters 5 — 5位纯字母\n"
+            "/mode letters 4 — 4位纯字母\n"
+            "/mode shuangpin — 小鹤双拼2音节\n"
+            "/mode shuangpin 3 — 3音节双拼\n"
+            "/mode shuangpin 2 ziranma — 自然码\n"
+            "/mode pinyin — 拼音组合\n"
+            "/status — 查看进度\n"
+            "/stop — 暂停\n"
+            "/resume — 继续\n"
+            "/found — 已发现靓号"
+        )
+
+    elif cmd == "mode":
+        if len(parts) < 2:
+            await bot_send(session, "用法：/mode letters 5 / shuangpin / pinyin")
+            return
+        mode   = parts[1].lower()
+        params = {}
+        if mode == "letters":
+            params["length"] = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 5
+        elif mode == "shuangpin":
+            params["syllables"] = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 2
+            params["scheme"]    = parts[3].lower() if len(parts) > 3 else "xiaohe"
+            if params["scheme"] not in _SCHEMES:
+                await bot_send(session, "⚠️ 可用方案：xiaohe / ziranma")
+                return
+        elif mode == "pinyin":
+            params["min_len"] = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 4
+        else:
+            await bot_send(session, "⚠️ 可用模式：letters / shuangpin / pinyin")
+            return
+
+        state["cfg"]["mode"]    = mode
+        state["cfg"]["params"]  = params
+        state["cfg"]["running"] = True
+        save_config(state["cfg"])
+        state["restart"] = True
+        await bot_send(session, "🔄 切换模式：<code>{} {}</code>\n扫描重新开始。".format(
+            mode, json.dumps(params, ensure_ascii=False)))
+
+    elif cmd == "status":
+        s   = state.get("stats", {})
+        cfg = state["cfg"]
+        running_str = "运行中 ▶" if cfg.get("running") else "已暂停 ⏸"
+        speed   = s.get("speed", 0.0)
+        total   = s.get("total", 0)
+        offset  = s.get("offset", 0)
+        pct     = offset / total * 100 if total > 0 else 0
+        eta     = (total - offset) / speed if speed > 0 else 0
+        eta_str = "{:.0f}分钟".format(eta) if eta < 1440 else "{:.1f}小时".format(eta / 60)
+        await bot_send(session,
+            "📊 <b>扫描状态</b>\n\n"
+            "状态：{}\n"
+            "模式：{} {}\n"
+            "速度：{:.0f} 个/分钟\n"
+            "已检测：{:,}\n"
+            "已发现靓号：{}\n"
+            "进度：{:.2f}%\n"
+            "预计剩余：{}".format(
+                running_str,
+                cfg["mode"], json.dumps(cfg.get("params", {}), ensure_ascii=False),
+                speed, s.get("checked", 0), s.get("found", 0), pct, eta_str,
+            )
+        )
+
+    elif cmd == "stop":
+        state["cfg"]["running"] = False
+        save_config(state["cfg"])
+        await bot_send(session, "⏸ 已暂停。发送 /resume 继续。")
+
+    elif cmd == "resume":
+        state["cfg"]["running"] = True
+        save_config(state["cfg"])
+        await bot_send(session, "▶ 已继续扫描。")
+
+    elif cmd == "found":
+        usernames = db.all_found()
+        if not usernames:
+            await bot_send(session, "📭 暂未发现可用靓号。")
+        else:
+            lines = ["🎯 <b>已发现靓号（共{}个）</b>".format(len(usernames))]
+            for u in usernames[:30]:
+                lines.append("• <code>@{0}</code>  <a href='https://t.me/{0}'>查看</a>".format(u))
+            if len(usernames) > 30:
+                lines.append("…还有{}个，查看 found.txt 获取完整列表".format(len(usernames) - 30))
+            await bot_send(session, "\n".join(lines))
+
+# ── Bot 轮询 ──────────────────────────────────────────────────────────────────
+
+async def run_bot(state, db, session):
+    offset = 0
+    while True:
+        updates = await bot_get_updates(session, offset)
+        for upd in updates:
+            offset = upd["update_id"] + 1
+            msg     = upd.get("message", {})
+            text    = msg.get("text", "")
+            chat_id = str(msg.get("chat", {}).get("id", ""))
+            if text.startswith("/") and chat_id == CHAT_ID:
+                try:
+                    await handle_cmd(text, state, db, session)
+                except Exception as e:
+                    await bot_send(session, "❌ 出错：{}".format(e))
+        await asyncio.sleep(0.5)
+
+# ── 主入口 ────────────────────────────────────────────────────────────────────
+
+async def main():
+    db    = StateDB()
+    cfg   = load_config()
+    state = {"cfg": cfg, "restart": False, "stats": {}}
+
+    connector = aiohttp.TCPConnector(limit=CONCURRENCY + 20, ssl=False)
+    session   = aiohttp.ClientSession(
+        connector=connector,
+        headers={"User-Agent": "Mozilla/5.0"},
     )
-    parser.add_argument("mode", choices=["letters","shuangpin","pinyin"],
-                        help="检测模式")
-    parser.add_argument("extra", nargs="?", type=int,
-                        help="letters: 位数(默认5)  shuangpin: 音节数(默认2)")
-    parser.add_argument("--length",        type=int, default=5,  help="letters 位数")
-    parser.add_argument("--syllables",     type=int, default=2,  help="shuangpin 音节数(2=4字符,3=6字符)")
-    parser.add_argument("--scheme",        default="xiaohe",     help="双拼方案: xiaohe(小鹤) / ziranma(自然码)")
-    parser.add_argument("--max-syllables", dest="max_syllables", type=int, default=2, help="pinyin 最大音节数")
-    parser.add_argument("--min-len",       dest="min_len",       type=int, default=4, help="pinyin 最短长度")
-    parser.add_argument("--concurrency",   type=int, default=100, help="并发协程数(默认100)")
-    parser.add_argument("--token",         default="",   help="Bot Token，用于推送通知")
-    parser.add_argument("--chat",          default="",   help="推送通知的 Chat ID")
 
-    args = parser.parse_args()
+    await bot_send(session,
+        "🚀 Username Sniper 已启动\n"
+        "当前模式：{} {}\n"
+        "发送 /start 查看全部命令".format(
+            cfg["mode"], json.dumps(cfg.get("params", {}), ensure_ascii=False)
+        )
+    )
 
-    # 处理位置参数 extra（如 `letters 4` 或 `shuangpin 3`）
-    if args.extra is not None:
-        if args.mode == "letters":
-            args.length = args.extra
-        elif args.mode == "shuangpin":
-            args.syllables = args.extra
+    asyncio.ensure_future(run_bot(state, db, session))
 
-    if args.scheme not in _SCHEMES:
-        sys.exit(f"❌ 未知双拼方案: {args.scheme}，可选: {', '.join(_SCHEMES)}")
-
-    asyncio.run(run(args))
+    while True:
+        if state["cfg"]["running"]:
+            await run_sniper(state, db, session)
+        else:
+            await asyncio.sleep(1)
 
 if __name__ == "__main__":
-    main()
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(main())
