@@ -227,13 +227,11 @@ async def check_one(session, sem, username, backoff):
                 # NFT/Fragment 拍卖中的用户名——已上链，不可自由注册
                 if "fragment.com" in html:
                     return "nft"
-                # 只有真实账号/频道的页面才有 CDN 头像链接
-                if "cdn.telegram-cdn.org" in html:
-                    return "taken"
-                # 二次确认：t.me 有时无头像但有真实页面标题
-                if 'property="og:title"' in html and "telegram.org" not in html[html.find('property="og:title"'):html.find('property="og:title"')+200]:
-                    return "taken"
-                return "available"
+                # 空闲用户名页：og:title 固定为 "Telegram: Contact @username"
+                if ("Telegram: Contact @" + username) in html:
+                    return "available"
+                # 其他情况：真实账号/频道/群组
+                return "taken"
         except Exception:
             return "error"
 
