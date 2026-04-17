@@ -447,13 +447,13 @@ async def handle_cmd(text, state, db, session):
             "状态：{}\n"
             "模式：{} {}\n"
             "速度：{:.0f} 个/分钟\n"
-            "已检测：{:,}\n"
+            "已迭代：{:,} / {:,}\n"
             "已发现靓号：{}\n"
             "进度：{:.2f}%\n"
             "预计剩余：{}".format(
                 running_str,
                 cfg["mode"], json.dumps(cfg.get("params", {}), ensure_ascii=False),
-                speed, s.get("checked", 0), s.get("found", 0), pct, eta_str,
+                iter_speed, offset, total, s.get("found", 0), pct, eta_str,
             )
         )
 
