@@ -37,7 +37,7 @@ except ImportError:
 
 BOT_TOKEN   = "8690075574:AAE2QCYhb08SXET1ukWWXxePPsJFaZM5KVg"
 CHAT_ID     = "877532"
-CONCURRENCY = 20
+CONCURRENCY = 8
 CONFIG_FILE = "sniper_config.json"
 DB_FILE     = "sniper_state.db"
 
@@ -217,29 +217,21 @@ async def check_one(session, sem, username):
     """
     async with sem:
         # ── 第一步：Bot API getChat ────────────────────────────────────────
-        for attempt in range(3):
-            try:
-                async with session.get(
-                    "https://api.telegram.org/bot{}/getChat".format(BOT_TOKEN),
-                    params={"chat_id": "@" + username},
-                    timeout=aiohttp.ClientTimeout(total=12),
-                ) as resp:
-                    if resp.status == 429:
-                        # 429：只让当前协程等待，不影响其他并发
-                        data = await resp.json()
-                        wait = data.get("parameters", {}).get("retry_after", 5)
-                        await asyncio.sleep(wait)
-                        continue
-                    data = await resp.json()
-                    if data.get("ok"):
-                        return "taken"
-                    desc = data.get("description", "").lower()
-                    if "chat not found" not in desc:
-                        return "error"
-                    break
-            except Exception:
-                return "error"
-        else:
+        try:
+            async with session.get(
+                "https://api.telegram.org/bot{}/getChat".format(BOT_TOKEN),
+                params={"chat_id": "@" + username},
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as resp:
+                if resp.status == 429:
+                    return "error"  # 限速直接跳过，不阻塞
+                data = await resp.json()
+                if data.get("ok"):
+                    return "taken"
+                desc = data.get("description", "").lower()
+                if "chat not found" not in desc:
+                    return "error"
+        except Exception:
             return "error"
 
         # ── 第二步：t.me 检查（捕获隐私设置的个人账号）────────────────────
