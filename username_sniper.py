@@ -48,7 +48,7 @@ SNIPER_TOKENS = [
     "8766221920:AAHg62TK5rt2PDKlpMwnZmN_UOeTvRiIC94",          # Bot 2
     "8685117355:AAFf-w2gZ_NRPoEduR_ibufALsg9iTosUAI",          # Bot 3
 ]
-CONCURRENCY = len(SNIPER_TOKENS) * 3  # 每个Token 3并发，稳定在限速线以下
+CONCURRENCY = len(SNIPER_TOKENS) * 5  # 每个Token 5并发
 
 logging.basicConfig(level=logging.WARNING, format="%(asctime)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -216,70 +216,68 @@ async def bot_get_updates(session, offset):
 
 # ── 检测 ──────────────────────────────────────────────────────────────────────
 
-async def check_one(session, sem, username, token):
+async def check_one(session, username, token):
     """
-    四步检测：
-      1. Bot API getChat     —— 已注册账号/频道 → taken
-      2. t.me tgme_page_title —— 隐私设置个人账号 → taken
-      3. Fragment.com        —— NFT 占用 → nft
-      4. 其余                —— available
+    三步检测（t.me 与 Fragment 并行）：
+      1. Bot API getChat      → taken / 继续
+      2. t.me + Fragment 并行 → taken / nft / available
     """
-    async with sem:
-        # ── 第一步：Bot API getChat ────────────────────────────────────────
-        try:
-            async with session.get(
-                "https://api.telegram.org/bot{}/getChat".format(token),
-                params={"chat_id": "@" + username},
-                timeout=aiohttp.ClientTimeout(total=12),
-            ) as resp:
-                if resp.status == 429:
-                    return "error"  # 限速直接跳过，不阻塞
-                data = await resp.json()
-                if data.get("ok"):
-                    return "taken"
-                desc = data.get("description", "").lower()
-                if "chat not found" not in desc:
-                    return "error"
-        except Exception:
-            return "error"
+    # ── 第一步：Bot API getChat ────────────────────────────────────────────
+    try:
+        async with session.get(
+            "https://api.telegram.org/bot{}/getChat".format(token),
+            params={"chat_id": "@" + username},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            if resp.status == 429:
+                return "error"
+            data = await resp.json()
+            if data.get("ok"):
+                return "taken"
+            if "chat not found" not in data.get("description", "").lower():
+                return "error"
+    except Exception:
+        return "error"
 
-        # ── 第二步：t.me 检查（捕获隐私设置的个人账号）────────────────────
+    # ── 第二步：t.me 与 Fragment 并行检测 ─────────────────────────────────
+    async def _tme():
         try:
             async with session.get(
                 "https://t.me/" + username,
                 headers={"User-Agent": "Mozilla/5.0"},
                 allow_redirects=True,
-                timeout=aiohttp.ClientTimeout(total=12),
-            ) as resp:
-                html = await resp.text(encoding="utf-8", errors="ignore")
-                # tgme_page_title 只在真实账号/频道页面存在
-                if "tgme_page_title" in html:
-                    return "taken"
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as r:
+                html = await r.text(encoding="utf-8", errors="ignore")
+                return "taken" if "tgme_page_title" in html else None
         except Exception:
-            pass
+            return None
 
-        # ── 第三步：Fragment.com 确认是否为 NFT ───────────────────────────
+    async def _fragment():
         try:
             async with session.get(
                 "https://fragment.com/username/" + username,
                 headers={"User-Agent": "Mozilla/5.0"},
-                timeout=aiohttp.ClientTimeout(total=12),
-            ) as resp:
-                if resp.status == 200:
-                    html = await resp.text(encoding="utf-8", errors="ignore")
-                    if "collectible" in html or "tm-status-" in html:
-                        return "nft"
+                timeout=aiohttp.ClientTimeout(total=5),
+            ) as r:
+                if r.status == 200:
+                    html = await r.text(encoding="utf-8", errors="ignore")
+                    return "nft" if ("collectible" in html or "tm-status-" in html) else None
         except Exception:
-            pass
+            return None
 
-        # ── 第四步：真正空闲 ──────────────────────────────────────────────
-        return "available"
+    tme, frag = await asyncio.gather(_tme(), _fragment())
+    if tme == "taken":
+        return "taken"
+    if frag == "nft":
+        return "nft"
+    return "available"
 
-# ── 扫描循环 ──────────────────────────────────────────────────────────────────
+# ── 扫描循环（滑动窗口，完成一个立刻补一个）─────────────────────────────────
 
 async def run_sniper(state, db, session):
-    cfg    = state["cfg"]
-    key    = config_key(cfg)
+    cfg   = state["cfg"]
+    key   = config_key(cfg)
     offset = db.get_offset(key)
 
     gen, total = make_generator(cfg)
@@ -291,69 +289,92 @@ async def run_sniper(state, db, session):
             state["cfg"]["running"] = False
             return
 
-    sem     = asyncio.Semaphore(CONCURRENCY)
     checked = 0
     found   = 0
     t_start = time.time()
-    batch   = []
+    n_tok   = len(SNIPER_TOKENS)
+    gen_idx = offset          # 绝对索引，用于轮询 token
+    pending = {}              # task → (abs_idx, username)
+    newly   = []
 
-    async def flush(b):
-        nonlocal checked, found
-        n_tok = len(SNIPER_TOKENS)
-        tasks = [asyncio.ensure_future(check_one(session, sem, u, SNIPER_TOKENS[i % n_tok])) for i, u in enumerate(b)]
-        results = await asyncio.gather(*tasks)
-        newly = []
-        for u, st in zip(b, results):
+    state["stats"] = {"checked": 0, "found": 0, "speed": 0.0, "total": total, "offset": offset}
+
+    def _submit(abs_idx, username):
+        tok  = SNIPER_TOKENS[abs_idx % n_tok]
+        task = asyncio.ensure_future(check_one(session, username, tok))
+        pending[task] = (abs_idx, username)
+
+    # 预填窗口
+    for combo in gen:
+        u = combo_to_str(combo)
+        if valid_tg(u):
+            _submit(gen_idx, u)
+        gen_idx += 1
+        if len(pending) >= CONCURRENCY:
+            break
+
+    while pending:
+        # 暂停支持
+        while not cfg.get("running"):
+            await asyncio.sleep(0.5)
+            if state.get("restart"):
+                break
+
+        # 模式切换支持
+        if state.get("restart"):
+            for t in list(pending):
+                t.cancel()
+            await asyncio.gather(*list(pending), return_exceptions=True)
+            state["restart"] = False
+            return
+
+        done_set, _ = await asyncio.wait(list(pending.keys()), return_when=asyncio.FIRST_COMPLETED)
+
+        for task in done_set:
+            abs_idx, username = pending.pop(task)
+            try:
+                st = task.result()
+            except Exception:
+                st = "error"
+
+            offset = abs_idx + 1
+
             if st == "available":
-                found += 1
+                found   += 1
                 checked += 1
-                db.add_found(u)
+                db.add_found(username)
                 with open("found.txt", "a") as f:
-                    f.write(u + "\n")
-                newly.append(u)
+                    f.write(username + "\n")
+                newly.append(username)
             elif st in ("taken", "nft"):
                 checked += 1
+
+            # 立刻补一个新任务
+            for combo in gen:
+                u = combo_to_str(combo)
+                gen_idx += 1
+                if valid_tg(u):
+                    _submit(gen_idx - 1, u)
+                    break
+
+        # 持久化进度
+        db.save_offset(key, offset)
+
+        # 推送通知
         if newly:
             lines = ["🎯 <b>发现可注册靓号！</b>"]
             for u in newly:
                 lines.append("• <code>@{0}</code>  <a href='https://t.me/{0}'>查看</a>".format(u))
             await bot_send(session, "\n".join(lines))
-        return len(b)
+            newly = []
 
-    state["stats"] = {"checked": 0, "found": 0, "speed": 0.0, "total": total, "offset": offset}
-
-    for combo in gen:
-        if state.get("restart"):
-            state["restart"] = False
-            return
-
-        u = combo_to_str(combo)
-        if not valid_tg(u):
-            continue
-
-        while not state["cfg"]["running"]:
-            await asyncio.sleep(1)
-            if state.get("restart"):
-                state["restart"] = False
-                return
-
-        batch.append(u)
-        if len(batch) >= CONCURRENCY:
-            done    = await flush(batch)
-            offset += done
-            db.save_offset(key, offset)
-            batch   = []
-
-            elapsed = time.time() - t_start
-            speed   = (checked + found) / elapsed * 60 if elapsed > 0 else 0
-            state["stats"] = {
-                "checked": checked, "found": found,
-                "speed": speed, "total": total, "offset": offset,
-            }
-
-    if batch:
-        await flush(batch)
-        db.save_offset(key, offset + len(batch))
+        # 更新统计
+        elapsed = time.time() - t_start
+        speed   = checked / elapsed * 60 if elapsed > 0 else 0
+        state["stats"] = {
+            "checked": checked, "found": found,
+            "speed": speed, "total": total, "offset": offset,
+        }
 
     await bot_send(session, "✅ 当前模式全部检测完毕，共发现 {} 个靓号。".format(found))
 
