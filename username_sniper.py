@@ -440,7 +440,7 @@ async def run_sniper(state, db, session):
 
         # 推送通知（含实用性评分）
         if newly:
-            lines = ["🎯 <b>发现可注册靓号！</b>"]
+            lines = ["🔍 <b>疑似可用靓号</b>（可能在冷冻期，30天后 /candidates 确认）"]
             for u in newly:
                 _, stars = score_username(u)
                 lines.append("• <code>@{0}</code> {1}  <a href='https://t.me/{0}'>查看</a>".format(u, stars))
