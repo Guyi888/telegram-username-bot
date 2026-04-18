@@ -325,13 +325,13 @@ async def check_one(session, username, token):
             async with session.get(
                 "https://fragment.com/username/" + username,
                 headers={"User-Agent": "Mozilla/5.0"},
-                timeout=aiohttp.ClientTimeout(total=5),
+                timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
                 if r.status == 200:
                     html = await r.text(encoding="utf-8", errors="ignore")
                     return "nft" if ("collectible" in html or "tm-status-" in html) else None
         except Exception:
-            return None
+            return "nft"  # 超时/失败时保守处理，避免误报Fragment用户名
 
     tme, frag = await asyncio.gather(_tme(), _fragment())
     if tme == "taken":
