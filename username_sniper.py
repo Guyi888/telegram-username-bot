@@ -327,11 +327,16 @@ async def check_one(session, username, token):
                 headers={"User-Agent": "Mozilla/5.0"},
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as r:
+                # Fragment 只对 NFT 用户名返回 200，非 NFT 会跳转/404
                 if r.status == 200:
+                    return "nft"
+                # 双保险：即使跳转后页面含关键词也判 NFT
+                if r.status in (301, 302):
                     html = await r.text(encoding="utf-8", errors="ignore")
-                    return "nft" if ("collectible" in html or "tm-status-" in html) else None
+                    if "collectible" in html or "tm-status-" in html:
+                        return "nft"
         except Exception:
-            return "nft"  # 超时/失败时保守处理，避免误报Fragment用户名
+            return "nft"  # 超时/网络失败时保守处理，避免误报
 
     tme, frag = await asyncio.gather(_tme(), _fragment())
     if tme == "taken":
